@@ -53,8 +53,7 @@ Hstoxav_Video *hstoxav_video_encoder_new(const char *name, int width, int height
     AVCodecContext *ctx = video->ctx;
     ctx->width = width;
     ctx->height = height;
-    // Hardware encoders take semi-planar more widely than planar.
-    ctx->pix_fmt = strstr(name, "_mediacodec") != NULL ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->bit_rate = bit_rate;
     ctx->time_base = (AVRational) {1, 1000};
     // A guess for encoders that pace their bit rate by it.
@@ -67,6 +66,8 @@ Hstoxav_Video *hstoxav_video_encoder_new(const char *name, int width, int height
         av_opt_set_int(ctx->priv_data, "cpu-used", 16, 0);
         av_opt_set_int(ctx->priv_data, "lag-in-frames", 0, 0);
         av_opt_set(ctx->priv_data, "error-resilient", "default+partitions", 0);
+        // Phone cameras are noisy, and noise costs bits.
+        av_opt_set_int(ctx->priv_data, "noise-sensitivity", 2, 0);
     } else if (strcmp(name, "libx264") == 0 || strcmp(name, "libx265") == 0) {
         av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
@@ -123,18 +124,8 @@ int hstoxav_video_send_frame(Hstoxav_Video *video, const uint8_t *y, const uint8
     const int chroma_width = (width + 1) / 2;
     const int chroma_height = (height + 1) / 2;
     copy_plane(frame->data[0], frame->linesize[0], y, width, height);
-    if (frame->format == AV_PIX_FMT_NV12) {
-        for (int row = 0; row < chroma_height; ++row) {
-            uint8_t *dst = frame->data[1] + row * frame->linesize[1];
-            for (int col = 0; col < chroma_width; ++col) {
-                dst[2 * col] = u[row * chroma_width + col];
-                dst[2 * col + 1] = v[row * chroma_width + col];
-            }
-        }
-    } else {
-        copy_plane(frame->data[1], frame->linesize[1], u, chroma_width, chroma_height);
-        copy_plane(frame->data[2], frame->linesize[2], v, chroma_width, chroma_height);
-    }
+    copy_plane(frame->data[1], frame->linesize[1], u, chroma_width, chroma_height);
+    copy_plane(frame->data[2], frame->linesize[2], v, chroma_width, chroma_height);
     frame->pts = pts;
     frame->pict_type = key ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
 #ifdef AV_FRAME_FLAG_KEY
@@ -149,7 +140,7 @@ int hstoxav_video_send_frame(Hstoxav_Video *video, const uint8_t *y, const uint8
     return avcodec_send_frame(video->ctx, frame);
 }
 
-int hstoxav_video_receive_packet(Hstoxav_Video *video, const uint8_t **data, int *size, int *key)
+int hstoxav_video_receive_packet(Hstoxav_Video *video, const uint8_t **data, int *size, int *key, int64_t *pts)
 {
     av_packet_unref(video->packet);
     const int ret = avcodec_receive_packet(video->ctx, video->packet);
@@ -162,6 +153,7 @@ int hstoxav_video_receive_packet(Hstoxav_Video *video, const uint8_t **data, int
     *data = video->packet->data;
     *size = video->packet->size;
     *key = (video->packet->flags & AV_PKT_FLAG_KEY) != 0;
+    *pts = video->packet->pts;
     return 0;
 }
 

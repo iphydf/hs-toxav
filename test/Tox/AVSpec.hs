@@ -27,7 +27,7 @@ data Side = A | B
 withPair :: ((ToxAV Side, ToxAV Side) -> IO a) -> IO a
 withPair = withLossyPair (\_ _ -> pure True)
 
--- | Delivering only the packets that pass.
+-- | Like 'withPair', but delivers only the packets that pass.
 withLossyPair :: (Side -> BS.ByteString -> IO Bool) -> ((ToxAV Side, ToxAV Side) -> IO a) -> IO a
 withLossyPair passes action = do
   wire <- newChan
@@ -145,7 +145,7 @@ spec = do
     [n | AudioReceived _ n _ _ <- behind ++ caughtUp] `shouldBe` [0 .. 99] ++ [150 .. 159]
 
   it "passes on audio that comes while it decodes video" $ do
-    -- Opened once A has sent it all, so that it comes together.
+    -- Holds back delivery while A sends, so the video and audio arrive together.
     gate <- newMVar ()
     withLossyPair (\_ _ -> True <$ readMVar gate) $ \pair@(a, b) -> do
       talking pair
@@ -159,7 +159,7 @@ spec = do
             Just VideoReceived {} -> picturesBefore (n + 1)
             Just _ -> picturesBefore n
             Nothing -> fail "no audio"
-      -- Not after all of them, as when it waited for each.
+      -- The audio doesn't wait for all three pictures to decode.
       picturesBefore (0 :: Int) >>= (`shouldSatisfy` (< 3))
 
   it "asks for a key frame when video is lost, so that pictures soon look right again" $ do

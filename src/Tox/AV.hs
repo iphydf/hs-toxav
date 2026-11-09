@@ -25,6 +25,7 @@ module Tox.AV
   , sendAudio
   , sendVideo
   , videoStats
+  , videoEncoderName
     -- * Re-exports
   , VideoStats (..)
   , BitRates (..)
@@ -83,10 +84,9 @@ import           Tox.AV.Session          (BitRates (..), Control (..), End (..),
                                           VideoStats (..), losslessIds,
                                           lossyIds)
 
--- | How to send a friend a packet, its id included. The functions are
--- called with the calls locked, so that packets go out in order: they must
--- queue the packet without waiting for it to go, and not call back into
--- 'ToxAV'.
+-- | How to send a friend a packet, its id included. We call these with the
+-- calls locked, so that packets go out in order: they must queue the packet
+-- without waiting for it to go, and not call back into 'ToxAV'.
 data Transport f = Transport
   { sendLossless :: f -> ByteString -> IO ()
   , sendLossy    :: f -> ByteString -> IO ()
@@ -98,8 +98,8 @@ data Event f
     -- ^ The friend answered, or changed what they send and accept.
   | Ended f End
   | AudioReceived f Word16 MediaTime AudioFrame
-    -- ^ The frame's number, one more than the last's, so that the client can
-    -- tell which never came, and when it was captured.
+    -- ^ Numbers count up by one, so that the client can tell which frames
+    -- never came. The time is when it was captured.
   | VideoReceived f MediaTime Picture
   deriving (Eq, Show)
 
@@ -117,28 +117,36 @@ flag f caps = caps .&. f == f
 data CallCodecs = CallCodecs
   { audioOut      :: MVar (Maybe ((Int, Int), AudioEncoder)) -- ^ By sampling rate and channels.
   , audioIn       :: MVar (Maybe (AudioKey, AudioDecoder))
-  , videoOut      :: MVar (Maybe ((Codec, Int, Int, Int), VideoEncoder))
-    -- ^ By codec, width, height and bit rate in bits per second.
+  , videoOut      :: MVar (Maybe VideoOut)
   , videoIn       :: MVar (Map.Map Codec VideoDecoder)
   , videoWaiting  :: MVar Waiting
   , videoWake     :: MVar () -- ^ Full once frames wait.
   , videoDecoding :: ThreadId -- ^ Decodes the frames that wait, in order.
   }
 
+data VideoOut = VideoOut
+  { outSize     :: (Codec, Int, Int) -- ^ The codec, width and height it's for.
+  , outBitRate  :: Int -- ^ In bits per second.
+  , outEncoder  :: VideoEncoder
+  , outCaptured :: Map.Map Word64 MediaTime
+    -- ^ When the pictures still in the encoder were captured, keyed by when we
+    -- gave them to it.
+  }
+
 -- | Frames to decode, and whether we skip frames until a key frame.
 data Waiting = Waiting Bool (Seq (Codec, MediaTime, ByteString))
 
--- | A frame joins those waiting to be decoded. With as many waiting as come
--- between our key frames, the decoder can't keep up: they go, as do the
--- frames up to the next key frame, which decodes without them.
+-- | Once as many frames wait as come between our key frames, the decoder
+-- can't keep up: we drop them and skip to the next key frame, which decodes
+-- without them.
 wait :: (Codec, MediaTime, ByteString) -> Waiting -> Waiting
 wait x@(codec, _, frame) (Waiting skipping frames)
   | Codec.keyFrame codec frame = Waiting False (frames |> x)
   | skipping || Seq.length frames >= Codec.keyFrameInterval codec = Waiting True Seq.empty
   | otherwise = Waiting False (frames |> x)
 
--- | A decoder's sampling rate and channels, and the samples per channel in
--- the last frame it decoded and when that was sent.
+-- | A decoder's sampling rate and channels, then the length of the last frame
+-- it decoded (samples per channel) and when that frame was sent.
 data AudioKey = AudioKey Int Int Int MediaTime
 
 data ToxAV f = ToxAV
@@ -268,7 +276,7 @@ closeCodecs c = do
   killThread (videoDecoding c)
   modifyMVar_ (audioOut c) $ \x -> Nothing <$ mapM_ (Codec.close . snd) x
   modifyMVar_ (audioIn c) $ \x -> Nothing <$ mapM_ (Codec.close . snd) x
-  modifyMVar_ (videoOut c) $ \x -> Nothing <$ mapM_ (Codec.close . snd) x
+  modifyMVar_ (videoOut c) $ \x -> Nothing <$ mapM_ (Codec.close . outEncoder) x
   modifyMVar_ (videoIn c) $ \x -> Map.empty <$ mapM_ Codec.close x
 
 using :: Ord f => (CallCodecs -> MVar a) -> ToxAV f -> f -> (a -> IO (a, b)) -> IO b
@@ -277,7 +285,7 @@ using part av f action = codecsOf av f >>= \c -> modifyMVar (part c) action
 samplingRates :: [Int]
 samplingRates = [8000, 12000, 16000, 24000, 48000]
 
--- | Sampling rate and Opus packet.
+-- | A payload is the sampling rate (4 bytes, big-endian), then the Opus packet.
 audioPayload :: ByteString -> Maybe (Int, ByteString)
 audioPayload bytes
   | BS.length rateBytes == 4, rate `elem` samplingRates = Just (rate, opus)
@@ -412,27 +420,48 @@ sendVideo av f captured picture
         let codec = Session.videoCodec f s
             Picture w h _ _ _ = picture
             bitRate = maybe 0 (fromIntegral . videoBitRate) (Session.bitRates f s) * 1000
-            key = (codec, w, h, bitRate)
+            size = (codec, w, h)
+            fresh current = do
+              mapM_ (Codec.close . outEncoder) current
+              fmap (\e -> (VideoOut size bitRate e Map.empty, True)) <$> Codec.videoEncoder codec w h bitRate
         frames <- using videoOut av f $ \current -> do
-          (enc, fresh) <- case current of
-            Just (k, enc) | k == key -> pure (Just enc, False)
-            _ -> do
-              mapM_ (Codec.close . snd) current
-              (, True) <$> Codec.videoEncoder codec w h bitRate
-          case enc of
-            Nothing -> pure (Nothing, Nothing)
+          out <- case current of
+            Just o | outSize o == size -> do
+              live <- if outBitRate o == bitRate then pure True else Codec.setVideoBitRate (outEncoder o) bitRate
+              if live then pure (Right (o { outBitRate = bitRate }, False)) else fresh current
+            _ -> fresh current
+          case out of
+            Left why -> pure (Nothing, Left why)
             -- An encoder that failed may stay broken (browsers' do), so the
             -- next picture gets a new one.
-            Just e -> Codec.encodeVideo e t (fresh || Session.wantsKeyFrame f s) picture >>= \case
-              Nothing -> (Nothing, Nothing) <$ Codec.close e
-              encoded -> pure (Just (key, e), encoded)
+            Right (o, fresh') -> Codec.encodeVideo (outEncoder o) t (fresh' || Session.wantsKeyFrame f s) picture >>= \case
+              Nothing -> do
+                err <- Codec.videoEncoderError (outEncoder o)
+                Codec.close (outEncoder o)
+                pure (Nothing, Left (Codec.encoderName (outEncoder o) <> " couldn't encode a picture" <> (if null err then "" else ": " <> err)))
+              Just encoded ->
+                let waiting = Map.insert t captured (outCaptured o)
+                    stamped = [ (Map.findWithDefault captured time waiting, isKey, bytes) | (time, isKey, bytes) <- encoded ]
+                    -- Pictures before the last one out won't come out later.
+                    left = case reverse encoded of
+                      (time, _, _) : _ -> snd (Map.split time waiting)
+                      []               -> waiting
+                in pure (Just o { outCaptured = left }, Right stamped)
         case frames of
-          Nothing
+          Left why
             | codec /= VP8 -> do
-                modifyMVar_ (avSession av) (pure . Session.encoderFailed f codec)
-                using videoOut av f $ \current -> (Nothing, ()) <$ mapM_ (Codec.close . snd) current
+                modifyMVar_ (avSession av) (pure . Session.encoderFailed f codec why)
+                using videoOut av f $ \current -> (Nothing, ()) <$ mapM_ (Codec.close . outEncoder) current
                 sendVideo av f captured picture
             | otherwise -> pure (Left InvalidFrame)
-          Just fs -> do
-            sent <- mapM (\(isKey, bytes) -> run av (Session.sendVideo captured f codec isKey bytes)) fs
+          Right fs -> do
+            sent <- mapM (\(time, isKey, bytes) -> run av (Session.sendVideo time f codec isKey bytes)) fs
             pure (either (Left . NotSending) (const (Right ())) (sequence sent))
+
+-- | What we send the friend's video with, Nothing until we send some, and
+-- why encoders we'd rather have used didn't work.
+videoEncoderName :: Ord f => ToxAV f -> f -> IO (Maybe String)
+videoEncoderName av f = do
+  failed <- Session.failedEncoders f <$> readMVar (avSession av)
+  using' <- Map.lookup f <$> readMVar (avCodecs av) >>= maybe (pure Nothing) (fmap (fmap (Codec.encoderName . outEncoder)) . readMVar . videoOut)
+  pure $ (<> concat [ ", as " <> show codec <> " didn't work: " <> why | (codec, why) <- failed ]) <$> using'

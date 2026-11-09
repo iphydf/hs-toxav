@@ -68,8 +68,8 @@ received, lost :: Int -> Meter -> Meter
 received n m = m { meterReceived = meterReceived m + fromIntegral n }
 lost n m = m { meterLost = meterLost m + fromIntegral n }
 
--- | A report once an interval has passed with media arriving, also without
--- loss, which tells the friend it may send more.
+-- | Due once an interval has passed and media came, even without loss: that
+-- tells the friend it may send more.
 due :: Word64 -> Meter -> Maybe (Report, Meter)
 due now m
   | now - meterSince m < interval || meterReceived m + meterLost m == 0 = Nothing

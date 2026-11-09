@@ -13,6 +13,7 @@ category:      Network
 description:   Tox audio and video calls, over any Tox implementation.
 extra-source-files:
   cbits/audio.h
+  cbits/mediacodec.h
   cbits/video.h
 
 source-repository head
@@ -57,6 +58,12 @@ library
     hs-source-dirs:    native
     c-sources:         cbits/video.c
     pkgconfig-depends: libavcodec, libavutil
+
+    -- The device's own H.264 encoder.
+    if os(android)
+      c-sources:       cbits/mediacodec.c
+      cpp-options:     -DHSTOXAV_MEDIACODEC
+      extra-libraries: mediandk
 
 -- The page in browser/ runs this: a call between two ToxAVs in one page.
 executable toxav-browser

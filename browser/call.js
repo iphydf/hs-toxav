@@ -37,7 +37,7 @@ wasi.initialize(instance);
 exports.hs_init(0, 0);
 
 const stats = { sent: 0, pictures: 0, shown: 0, audio: 0, loudest: 0 };
-// When the picture being sent started, as a stuck encoder stops the camera.
+// When sending the current picture started, so that we log a stuck encoder.
 let sendingSince = null, stuck = false;
 addEventListener("visibilitychange", () => log(`page ${document.hidden ? "hidden" : "shown"}`));
 const statsView = document.getElementById("stats");

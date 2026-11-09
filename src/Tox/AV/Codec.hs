@@ -21,6 +21,9 @@ module Tox.AV.Codec
   , VideoEncoder
   , videoEncoder
   , encodeVideo
+  , setVideoBitRate
+  , videoEncoderError
+  , encoderName
   , VideoDecoder
   , videoDecoder
   , decodeVideo

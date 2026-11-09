@@ -2,6 +2,7 @@ module Tox.AV.CodecSpec (spec) where
 
 import qualified Data.ByteString      as BS
 import           Data.IORef           (modifyIORef, newIORef, readIORef)
+import           Data.List            (nub)
 import qualified Data.Vector.Storable as V
 import           Test.Hspec
 
@@ -44,6 +45,11 @@ spec = do
     V.length <$> must (decodeAudio dec packet) `shouldReturn` 1920
     V.length <$> must (concealAudio dec 960) `shouldReturn` 1920
 
+  it "sends silence and a tone in packets of one size, which tell nothing of what is said" $ do
+    enc <- must (audioEncoder 48000 2 64000)
+    packets <- mapM (must . encodeAudio enc) (replicate 5 (V.replicate 1920 0) ++ replicate 5 (tone 48000 960))
+    length (nub (map BS.length packets)) `shouldBe` 1
+
   it "refuses frames Opus can't take" $ do
     enc <- must (audioEncoder 48000 2 64000)
     encodeAudio enc (tone 48000 100) `shouldReturn` Nothing
@@ -51,25 +57,27 @@ spec = do
   mapM_ videoRoundTrip [VP8, H264]
 
   it "refuses pictures smaller than they say" $ do
-    enc <- must (videoEncoder VP8 64 48 500000)
+    enc <- either fail pure =<< videoEncoder VP8 64 48 500000
     encodeVideo enc 0 True (picture 64 47) { pictureHeight = 48 } `shouldReturn` Nothing
 
   it "decodes no pictures larger than allowed" $ do
-    enc <- must (videoEncoder VP8 66 50 500000)
+    enc <- either fail pure =<< videoEncoder VP8 66 50 500000
     frames <- must (encodeVideo enc 0 True (picture 66 50))
     (dec, decoded) <- collecting (videoDecoder VP8 (33 * 50))
-    mapM_ (decodeVideo dec (MediaTime 0) . snd) frames
+    mapM_ (decodeVideo dec (MediaTime 0) . frameBytes) frames
     decoded `shouldReturn` []
+
+frameBytes :: (a, b, BS.ByteString) -> BS.ByteString
+frameBytes (_, _, bytes) = bytes
 
 videoRoundTrip :: Codec -> Spec
 videoRoundTrip codec = it ("encodes and decodes " ++ show codec) $ do
-  enc <- must (videoEncoder codec 66 50 500000)
+  enc <- either fail pure =<< videoEncoder codec 66 50 500000
   frames <- must (encodeVideo enc 0 True (picture 66 50))
-  map fst frames `shouldBe` [True]
   later <- must (encodeVideo enc 33 False (picture 66 50))
-  map fst later `shouldBe` [False]
-  map (keyFrame codec . snd) (frames ++ later) `shouldBe` [True, False]
+  [(time, key) | (time, key, _) <- frames ++ later] `shouldBe` [(0, True), (33, False)]
+  map (keyFrame codec . frameBytes) (frames ++ later) `shouldBe` [True, False]
   (dec, decoded) <- collecting (videoDecoder codec (3840 * 2160))
-  mapM_ (decodeVideo dec (MediaTime 7) . snd) frames
+  mapM_ (decodeVideo dec (MediaTime 7) . frameBytes) frames
   pictures <- decoded
   map (\(t, p) -> (t, pictureWidth p, pictureHeight p, BS.length (pictureU p))) pictures `shouldBe` [(MediaTime 7, 66, 50, 33 * 25)]

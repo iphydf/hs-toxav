@@ -27,6 +27,7 @@ module Tox.AV.Session
   , wantsKeyFrame
   , videoCodec
   , encoderFailed
+  , failedEncoders
   , bitRates
   , VideoStats (..)
   , videoStats
@@ -90,19 +91,19 @@ data Call = Call
   , callHeard      :: Word64
     -- ^ When the friend last reported, or the call began.
   , callPeerH264   :: Bool
-  , callFailed     :: Set.Set Codec -- ^ Encoders that didn't work.
+  , callFailed     :: Map.Map Codec String -- ^ Encoders that didn't work, and why.
   }
 
 -- | How the friend's video came, this call. A frame decoded after a lost one
 -- looks wrong until a key frame, which decodes on its own: the smear.
 data VideoStats = VideoStats
   { framesCame       :: Int
-  , framesIncomplete :: Int -- ^ Some of whose pieces never came.
-  , framesLost       :: Int -- ^ Incomplete ones too.
+  , framesIncomplete :: Int -- ^ Frames with pieces that never came.
+  , framesLost       :: Int -- ^ Including incomplete ones.
   , keyFramesCame    :: Int
   , smears           :: Int
   , smearedFrames    :: Int
-  , smearedMs        :: Int -- ^ Of smears that a key frame ended.
+  , smearedMs        :: Int -- ^ Only smears that a key frame ended.
   , picturesDecoded  :: Int
   , decodeFailures   :: Int
   } deriving (Eq, Show)
@@ -126,8 +127,8 @@ data Output f
   | SendLossy f ByteString
   | Event (Event f)
   | AudioIn f Word16 (Maybe (MediaTime, ByteString))
-    -- ^ Its number, and when it was sent with the sampling rate and Opus
-    -- packet, or 'Nothing' for a lost one.
+    -- ^ The frame's number, and when it was sent with its sampling rate and
+    -- Opus packet ('Nothing' if it was lost).
   | VideoIn f Codec MediaTime ByteString
   deriving (Eq, Show)
 
@@ -167,14 +168,14 @@ data Control
 
 msiId, videoControlId :: Word8
 msiId = 69
--- | 'askKeyFrame' or 'decodesH264', for the friend's video.
+-- | Followed by 'askKeyFrame' or 'decodesH264'.
 videoControlId = 172
 
 askKeyFrame, decodesH264 :: Word8
 askKeyFrame = 0
 decodesH264 = 1
 
--- | Starting a call, we tell the friend what we decode besides VP8.
+-- | When a call starts, we tell the friend what we decode besides VP8.
 decodable :: f -> Session f -> [Output f]
 decodable f s = [SendLossless f (BS.pack [videoControlId, decodesH264]) | Set.member H264 (sessionDecoders s)]
 
@@ -183,7 +184,8 @@ losslessIds, lossyIds :: [Word8]
 losslessIds = [msiId, videoControlId]
 lossyIds = [RTP.packetId Audio, RTP.packetId Video, Bandwidth.packetId]
 
--- | Key frames start every call, as C toxcore has no way to ask for one.
+-- | Each call starts with this many key frames, as C toxcore has no way to
+-- ask for one.
 startKeyFrames :: Int
 startKeyFrames = 7
 
@@ -244,7 +246,7 @@ newCall now phase self peer rates = Call
   , callLastReport = Nothing
   , callHeard = now
   , callPeerH264 = False
-  , callFailed = Set.empty
+  , callFailed = Map.empty
   }
 
 capabilities :: BitRates -> Capabilities
@@ -393,14 +395,17 @@ receivePiece f piece s = case Map.lookup f (sessionCalls s) of
         let c' = c { callMeter = Bandwidth.lost missing (callMeter c) }
         in (if m == Video then counted (\v -> v { framesIncomplete = framesIncomplete v + 1 }) c' else c', outs)
       Assembler.Complete sequ time flags bytes -> case m of
+        -- Frames that never came count as lost, each as long as this one:
+        -- audio goes at a constant bit rate.
         Audio ->
           let (ready, buffer) = JitterBuffer.drain (JitterBuffer.insert sequ (time, bytes) (callAudio c))
-          in (c { callAudio = buffer }, outs ++ map (uncurry (AudioIn f)) ready)
+              missing = length [() | (_, Nothing) <- ready] * BS.length bytes
+          in (c { callAudio = buffer, callMeter = Bandwidth.lost missing (callMeter c) }, outs ++ map (uncurry (AudioIn f)) ready)
         Video
           | maybe True (\l -> RTP.ahead l sequ > 0) (callLastVideo c) ->
               let c' = videoCame (maybe 0 (\l -> RTP.ahead l sequ - 1) (callLastVideo c)) (RTP.hasFlags RTP.keyFrame flags) time c { callLastVideo = Just sequ }
-                  -- A key frame ends the smear. C toxcore's clients don't
-                  -- know the asking, and ignore it.
+                  -- A key frame ends the smear. C toxcore's clients ignore
+                  -- the request.
                   ask = [SendLossless f (BS.pack [videoControlId, askKeyFrame]) | isNothing (callSmearing c), isJust (callSmearing c')]
               in (c', outs ++ ask ++ [VideoIn f (RTP.codecOf flags) time bytes])
           | otherwise -> (c, outs)
@@ -556,13 +561,16 @@ videoCodec f s
   | Set.member H264 (sessionEncoders s)
   , Just c <- Map.lookup f (sessionCalls s)
   , callPeerH264 c
-  , not (Set.member H264 (callFailed c)) = H264
+  , not (Map.member H264 (callFailed c)) = H264
   | otherwise = VP8
 
 -- | The encoder for the friend's call couldn't be made or didn't encode.
-encoderFailed :: Ord f => f -> Codec -> Session f -> Session f
-encoderFailed f codec s = s
-  { sessionCalls = Map.adjust (\c -> c { callFailed = Set.insert codec (callFailed c) }) f (sessionCalls s) }
+encoderFailed :: Ord f => f -> Codec -> String -> Session f -> Session f
+encoderFailed f codec why s = s
+  { sessionCalls = Map.adjust (\c -> c { callFailed = Map.insert codec why (callFailed c) }) f (sessionCalls s) }
+
+failedEncoders :: Ord f => f -> Session f -> [(Codec, String)]
+failedEncoders f = maybe [] (Map.toList . callFailed) . Map.lookup f . sessionCalls
 
 -- | Nothing when not in a call.
 bitRates :: Ord f => f -> Session f -> Maybe BitRates

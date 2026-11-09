@@ -35,7 +35,7 @@ data Playout = Playout
   , audioDelays :: Delays
   , videoDelays :: Delays
   , pending     :: Seq (Ms, Ms, AudioFrame)
-    -- ^ Where each frame goes, and how long of audio before it never came.
+    -- ^ Where each frame goes, and how many ms of audio before it never came.
   , lastAudio   :: Maybe (Word16, Ms, Ms)
     -- ^ The last frame's number, where it went, and how long it was.
   , stream      :: Maybe Stream
@@ -49,7 +49,7 @@ data Playout = Playout
 data Stats = Stats
   { spedUp     :: Int -- ^ Pitch periods left out.
   , slowedDown :: Int -- ^ Pitch periods played twice.
-  , madeUp     :: Int -- ^ Blocks of audio made up: that never came, or ran out.
+  , madeUp     :: Int -- ^ Blocks we made up, as audio never came or ran out.
   , skipped    :: Int -- ^ Jumps ahead when too far behind.
   } deriving (Eq, Show)
 
@@ -96,17 +96,17 @@ tooFarBehind = 200
 fadeMs :: Ms
 fadeMs = 60
 
--- | Pictures are big, so this many at most wait.
+-- | At most this many pictures wait, as they're big.
 maxPictures :: Int
 maxPictures = 30
 
--- | So that a client that doesn't pull audio doesn't fill its memory.
+-- | At most this many audio frames wait to be pulled, so that a client that
+-- doesn't pull audio doesn't fill its memory.
 maxPending :: Int
 maxPending = 100
 
--- | A decoded audio frame, its number, when it was captured and when it came.
--- Numbers count up by one a frame, so each frame follows the last, after any
--- that never came. Times only guide where frames go slowly: they jitter,
+-- | Numbers count up by one a frame, so each frame follows the last, after
+-- any that never came. Times only nudge where frames go: they jitter,
 -- c-toxcore's are when they were sent, and the sender's clock drifts from its
 -- samples.
 audio :: MediaTime -> Word16 -> MediaTime -> AudioFrame -> Playout -> Playout
@@ -136,7 +136,6 @@ bounded = \case
 frameMs :: AudioFrame -> Ms
 frameMs (AudioFrame rate channels pcm) = fromIntegral (V.length pcm `div` channels) * 1000 / fromIntegral rate
 
--- | A decoded picture, when it was captured and when it came.
 picture :: MediaTime -> MediaTime -> Picture -> Playout -> Playout
 picture came captured pic p0 = p
   { videoDelays = addDelay (c - s) (videoDelays p)
@@ -155,9 +154,9 @@ senderMs p t = maybe 0 (fromIntegral . since t . fst) (bases p)
 ourMs p t = maybe 0 (fromIntegral . since t . snd) (bases p)
 
 -- | The delay both audio and video aim for, as long as the slower needs, and
--- the least audio may fall to: three quarters of its delays as in NetEQ, and
--- how far ahead it's pulled, but never under video's need, as WebRTC does.
--- Each needs to have come by the time it's pulled or asked for.
+-- the least audio may fall to: three quarters of its delay (as in NetEQ)
+-- plus how far ahead it's pulled, but never under video's need (as WebRTC
+-- does). Each needs to have come by the time it's pulled or asked for.
 target :: Playout -> Maybe (Ms, Ms)
 target p = aim <$> nonEmpty (catMaybes [audioNeed, videoNeed])
   where
@@ -195,9 +194,9 @@ admit now d p = case (stream p, Seq.viewl (pending p)) of
     start s (AudioFrame rate channels pcm) = Stream rate channels s pcm V.empty Nothing 0
     madeUpFor made counts = counts { madeUp = madeUp counts + ceiling (made / blockMs) }
 
--- | Adds a frame to the end of the audio, after audio made up for what never
--- came before it, and how many ms that is. Nothing to start over, after a
--- long gap or with a new sampling rate.
+-- | Adds a frame after audio made up for what never came before it, and
+-- returns how many ms it made up. Nothing to start over, after a long gap or
+-- with a new sampling rate.
 append :: Ms -> Ms -> AudioFrame -> Stream -> Maybe (Stream, Ms)
 append t missing (AudioFrame rate channels pcm) st
   | (rate, channels) /= (streamRate st, streamChannels st) || abs gap > tooFarBehind = Nothing
@@ -268,7 +267,8 @@ lastFrames :: Stream -> Int -> Pcm -> Pcm
 lastFrames st n pcm = V.drop (V.length pcm - n * streamChannels st) pcm
 
 -- | Speeds up or slows down a pitch period to keep to the delay, or jumps
--- ahead when far behind. Above the delay, the band is NetEQ's.
+-- ahead when far behind. We speed up above the delay and slow down below
+-- the low mark, at least 20 ms apart as in NetEQ.
 adjust :: Ms -> (Ms, Ms) -> Stream -> Stats -> (Stream, Stats)
 adjust now (d, low) st counts
   | behind - d > tooFarBehind, have > blockMs =
@@ -406,8 +406,7 @@ pictureAt at seenAt p0 = case delay of
       Just st | maybe True ((< samplesIn st fadeMs) . snd) (concealing st) -> Just (heardBehind st)
       _ -> fst <$> target p
 
--- | When each lead came and how long it was, the furthest of the last
--- 'leadMemory' first and only those that later ones don't beat after it.
+-- | When each lead came and how long it was, longest first.
 type Leads = Seq (Ms, Ms)
 
 -- | Leads that come back within this long hold the delay, so that it
@@ -421,14 +420,14 @@ lead now l leads = Seq.dropWhileL ((< now - leadMemory) . fst) (Seq.dropWhileR (
 furthest :: Leads -> Ms
 furthest = maybe 0 snd . Seq.lookup 0
 
--- | Delays from capture to us by whole milliseconds, weighed by how recently
--- they came, and the weight of the next.
+-- | Weights of the delays from capture to us, by whole milliseconds. Newer
+-- ones weigh more: the first field is the weight the next one gets.
 data Delays = Delays Double (IntMap.IntMap Double)
 
 noDelays :: Delays
 noDelays = Delays 1 IntMap.empty
 
--- | The first frame counts as two: one that came this many ms later too, as
+-- | The first frame also counts as one that came this many ms later, as
 -- NetEQ starts at 80 ms. Until a few have come, they don't say what's enough.
 startDelay :: Int
 startDelay = 80

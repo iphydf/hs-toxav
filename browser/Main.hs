@@ -1,8 +1,8 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE StrictData #-}
--- | A call between two ToxAVs in one page, with nothing in between: the
--- camera and microphone go into one, and what the other receives comes back
--- out. For trying the codecs in a browser.
+-- | A call between two ToxAVs in one page, for trying the codecs in a
+-- browser: the camera and microphone go into one, and what the other receives
+-- comes back out.
 module Main (main) where
 
 import           Control.Concurrent           (forkIO)
@@ -132,9 +132,9 @@ start page = do
       Nothing -> js_null
       Just (captured, AudioFrame rate channels pcm) ->
         V.unsafeWith pcm $ \ptr -> js_block rate channels ptr (V.length pcm) (since heardAt captured)
-  -- The latest picture due by the time it's seen until, some ms from now,
-  -- and how long after its capture it's seen, in the middle of that. With
-  -- lip sync off, every picture that came is due.
+  -- The latest picture due by the end of the next showing (some ms from now),
+  -- and how long after its capture it's seen (at the middle of the showing).
+  -- With lip sync off, every picture that came is due.
   picture <- js_shower $ \middle end sync -> do
     now <- AV.clock
     let seenUntil = AV.later (round end) now
@@ -152,7 +152,7 @@ start page = do
 capturedAgo :: Double -> IO AV.MediaTime
 capturedAgo age = AV.later (negate (round age)) <$> AV.clock
 
--- | Says what sending gives whenever it changes, rather than for every frame.
+-- | Logs what sending returns when it changes, not for every frame.
 sender :: (Eq a, Show a) => (String -> IO ()) -> (Int -> Int -> JSVal -> Double -> IO a) -> IO JSVal
 sender say send = do
   previous <- newIORef Nothing

@@ -147,6 +147,12 @@ spec = do
         (_, outs) = tick Bandwidth.interval (worldSessions w Map.! B)
     outs `shouldBe` [SendLossy A (Bandwidth.encode (Report 0 5))]
 
+  it "reports audio frames that never came as lost, each as long as one that did" $ do
+    let frame n = RTP.packets Audio (Frame n (MediaTime (20 * fromIntegral n)) 1 mempty (BS.replicate 5 0))
+        b = foldl' (\s p -> fst (receive 0 A p s)) (worldSessions talking Map.! B) (concatMap frame [0, 3, 4, 5])
+        (_, outs) = tick Bandwidth.interval b
+    outs `shouldBe` [SendLossy A (Bandwidth.encode (Report 10 20))]
+
   it "sends key frames first and when asked" $ do
     let sent = act A (sendVideo (MediaTime 0) B VP8 False BS.empty)
         w7 = iterate sent talking !! 7
@@ -158,5 +164,6 @@ spec = do
   it "sends H.264 to a friend that decodes it, as both say when the call starts" $ do
     let w = act B (answer 0 A both) (act A (call 0 B both) (start [VP8, H264]))
     (videoCodec B (worldSessions w Map.! A), videoCodec A (worldSessions w Map.! B)) `shouldBe` (H264, H264)
-    videoCodec B (encoderFailed B H264 (worldSessions w Map.! A)) `shouldBe` VP8
+    let failed = encoderFailed B H264 "broken" (worldSessions w Map.! A)
+    (videoCodec B failed, failedEncoders B failed) `shouldBe` (VP8, [(H264, "broken")])
     videoCodec B (worldSessions talking Map.! A) `shouldBe` VP8

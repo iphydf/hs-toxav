@@ -25,7 +25,7 @@ import           Foreign.Ptr          (FunPtr, Ptr, nullPtr)
 
 import           Tox.AV.RTP           (Codec (..))
 
--- | Interleaved 16-bit samples.
+-- | Interleaved samples.
 type Pcm = V.Vector Int16
 
 data AudioFrame = AudioFrame

@@ -1,9 +1,13 @@
-{-# LANGUAGE StrictData #-}
+{-# LANGUAGE StrictData    #-}
+{-# LANGUAGE TupleSections #-}
 -- | Video through the browser's codecs (WebCodecs).
 module Tox.AV.Codec.Video
   ( VideoEncoder
   , videoEncoder
   , encodeVideo
+  , setVideoBitRate
+  , videoEncoderError
+  , encoderName
   , VideoDecoder
   , videoDecoder
   , decodeVideo
@@ -35,9 +39,9 @@ codecString codec = toJSString $ case codec of
   H265 -> "hvc1.1.6.L120.B0"
 
 -- Encoders and decoders are JavaScript objects holding the codec, and for
--- encoders, what it gave back that we haven't taken yet. The calls copy our
--- bytes before their first await, as other Haskell threads may grow the
--- memory meanwhile, which detaches memory.buffer.
+-- encoders, the frames we haven't taken yet. The calls copy our bytes before
+-- their first await, as other Haskell threads may grow the memory meanwhile,
+-- which detaches memory.buffer.
 
 foreign import javascript unsafe
   "({codec: $1, width: $2, height: $3, bitrate: $4, framerate: 30, latencyMode: 'realtime', avc: {format: 'annexb'}, hevc: {format: 'annexb'}})"
@@ -82,9 +86,9 @@ foreign import javascript safe
 -- software decoders, as hardware ones may give RGB, which loses the exact
 -- I420. Each format, error and dropped picture goes to the console once.
 --
--- Each picture goes to Haskell as packed I420 once decoded, one at a time so
--- that they stay in order, leaving out other formats and ones over the
--- limit. RGB goes back to YUV as BT.709 limited range, as Chrome labels our
+-- Each decoded picture goes to Haskell as packed I420, one at a time so that
+-- they stay in order. Other formats and pictures over the limit are dropped.
+-- RGB goes back to YUV as BT.709 limited range, as Chrome labels our
 -- pictures BT.709 when it converts them.
 foreign import javascript safe
   "const config = {codec: $1, optimizeForLatency: true, hardwareAcceleration: 'prefer-software'};\
@@ -196,15 +200,17 @@ data VideoEncoder = VideoEncoder
 instance Close VideoEncoder where
   close = js_close . encoderJs
 
--- | For pictures of a size, in bits per second.
-videoEncoder :: Codec -> Int -> Int -> Int -> IO (Maybe VideoEncoder)
+-- | Takes the width, height and bits per second.
+videoEncoder :: Codec -> Int -> Int -> Int -> IO (Either String VideoEncoder)
 videoEncoder codec width height bitRate =
   encoderConfig codec width height bitRate >>= js_encoderNew >>= nonNull
-    >>= traverse (\js -> flip (VideoEncoder codec) js <$> newIORef (keyFrameInterval codec))
+    >>= maybe (pure (Left "the browser can't encode it"))
+          (\js -> Right . flip (VideoEncoder codec) js <$> newIORef (keyFrameInterval codec))
 
--- | Each frame comes with whether it's a key frame. The time is in
--- milliseconds.
-encodeVideo :: VideoEncoder -> Word64 -> Bool -> Picture -> IO (Maybe [(Bool, ByteString)])
+-- | Each frame comes with the time of the picture it's from, in
+-- milliseconds, and whether it's a key frame. As we flush after each
+-- picture, that's always this one.
+encodeVideo :: VideoEncoder -> Word64 -> Bool -> Picture -> IO (Maybe [(Word64, Bool, ByteString)])
 encodeVideo enc time asked picture@(Picture w h y u v)
   | not (complete picture) = pure Nothing
   | otherwise = do
@@ -212,23 +218,33 @@ encodeVideo enc time asked picture@(Picture w h y u v)
         let key = asked || n >= keyFrameInterval (encoderCodec enc) in (bool (n + 1) 1 key, key)
       chunks <- BS.unsafeUseAsCString y $ \py -> BS.unsafeUseAsCString u $ \pu -> BS.unsafeUseAsCString v $ \pv ->
         js_encode (encoderJs enc) (castPtr py) (castPtr pu) (castPtr pv) w h (fromIntegral time) key
-      nonNull chunks >>= traverse (indices >=> mapM (\i -> (,) <$> js_key chunks i <*> (bytesOf =<< js_bytesAt chunks i)))
+      nonNull chunks >>= traverse (indices >=> mapM (\i -> (time,,) <$> js_key chunks i <*> (bytesOf =<< js_bytesAt chunks i)))
+
+-- | In bits per second. False, as the encoder is made again for it.
+setVideoBitRate :: VideoEncoder -> Int -> IO Bool
+setVideoBitRate _ _ = pure False
+
+-- | Empty, as the browser's console says what went wrong.
+videoEncoderError :: VideoEncoder -> IO String
+videoEncoderError _ = pure ""
+
+encoderName :: VideoEncoder -> String
+encoderName = ("WebCodecs " <>) . show . encoderCodec
 
 data VideoDecoder = VideoDecoder Codec JSVal JSVal
 
 instance Close VideoDecoder where
   close (VideoDecoder _ js give) = js_close js >> freeJSVal give
 
--- | Pixel limit, and where each picture goes once decoded, with the time of
--- the frame it's from.
+-- | Takes a pixel limit, and where to send each decoded picture with its
+-- frame's time.
 videoDecoder :: Codec -> Int -> ((MediaTime, Picture) -> IO ()) -> IO (Maybe VideoDecoder)
 videoDecoder codec maxPixels deliver = do
   give <- js_giver $ \w h time bytes -> bytesOf bytes >>= deliver . (,) (MediaTime (round time)) . fromI420 w h
   js_decoderNew (codecString codec) maxPixels give >>= nonNull
     >>= maybe (Nothing <$ freeJSVal give) (pure . Just . flip (VideoDecoder codec) give)
 
--- | The frame's pictures go where the decoder sends them, once the browser
--- has decoded them. True, as the browser tells of failures later.
+-- | The browser decodes the frame later, so this is always 'True'.
 decodeVideo :: VideoDecoder -> MediaTime -> ByteString -> IO Bool
 decodeVideo (VideoDecoder codec js _) (MediaTime time) frame = BS.unsafeUseAsCStringLen frame $ \(bytes, len) ->
   True <$ js_decode js (castPtr bytes) len (keyFrame codec frame) (fromIntegral time)

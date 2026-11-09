@@ -38,7 +38,7 @@ spec = do
 
   it "takes short pieces only at a frame's end" $ case pieces 0 3000 of
     p1 : _ -> do
-      -- Kept, it would be the oldest frame, given up on for the new ones.
+      -- Had it been kept, the new frames would push it out as incomplete.
       let others = concatMap (take 1 . (`pieces` 3000)) [1 .. maxPending]
       snd (feed (p1 { pieceData = BS.take 1 (pieceData p1) } : others)) `shouldBe` []
     [] -> expectationFailure "no pieces"

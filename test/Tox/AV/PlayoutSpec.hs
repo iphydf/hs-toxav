@@ -43,8 +43,9 @@ data Run = Run
 simulate :: Int -> [(Int, Int, AudioFrame)] -> [(Int, Int)] -> Run
 simulate = simulateFrom 0 (const 0)
 
--- | Starting at a time, and pulling each block some ms before it's heard,
--- by when it's heard. The audio comes in up to when it's pulled.
+-- | Like 'simulate', but from a start time, and pulling each block early (how
+-- many ms is a function of when it's heard). Audio comes in up to when each
+-- block is pulled.
 simulateFrom :: Int -> (Int -> Int) -> Int -> [(Int, Int, AudioFrame)] -> [(Int, Int)] -> Run
 simulateFrom start ahead end audios pics = go start (sortOn came inOrder) (sortOn fst pics) empty [] []
   where
@@ -178,7 +179,7 @@ spec = do
   it "makes up audio for frames that never came, and fades back into the rest" $ do
     -- Frames captured from 1 s to 1.06 s never come.
     let r = simulate 2900 [(if n >= 50 && n <= 52 then 10000 else 20 * n + 30, 20 * n, tone n) | n <- [0 .. 149]] []
-    -- 60 ms, in blocks it needn't line up with.
+    -- 60 ms: 6 blocks of 10 ms, or 7 if the gap doesn't line up with them.
     madeUp (stats (final r)) `shouldSatisfy` (`elem` [6, 7])
     delaysFrom 1200 r `shouldSatisfy` steadyWithin 50
     biggestStep (samples (heard r)) `shouldSatisfy` (< 450)
